@@ -53,6 +53,79 @@ static bool mtd_layout_save_pending;
 const char *get_mtd_layout_label(void);
 #endif
 
+#if defined(CONFIG_MEDIATEK_MULTI_MTD_LAYOUT) && defined(CONFIG_MTD)
+#define ORAY_UBI0_LAYOUT_LABEL		"oray-ubi0"
+#define ORAY_BDINFO_TAIL_OFFSET		0x40000
+#define ORAY_BDINFO_TAIL_SIZE		0x40000
+
+/*
+ * The TR3000-compatible layout starts its UBI partition at 0x5c0000.  This
+ * overlaps the upper 256 KiB of the stock X1 Pro bdinfo partition and all of
+ * its kpanic partition.  The supplied stock backups show that both regions
+ * are erased (0xff), while the lower half of bdinfo contains device-specific
+ * data and must be preserved.
+ *
+ * Restore those erased regions before writing a stock image to ubi_0.  Do
+ * not embed bdinfo data here: keeping the lower half intact preserves the
+ * MAC address and makes the same bootloader safe for different units.
+ */
+static int failsafe_restore_oray_ubi0_aux_parts(failsafe_fw_t type)
+{
+	const char *layout;
+	struct mtd_info *mtd;
+	int ret;
+
+	if (type != FW_TYPE_FW)
+		return 0;
+
+	layout = mtd_layout_label[0] ? mtd_layout_label :
+		 get_mtd_layout_label();
+	if (!layout || strcmp(layout, ORAY_UBI0_LAYOUT_LABEL))
+		return 0;
+
+	printf("httpd: restoring Oray X1 Pro stock auxiliary partitions\n");
+	gen_mtd_probe_devices();
+
+	mtd = get_mtd_device_nm("bdinfo");
+	if (IS_ERR_OR_NULL(mtd)) {
+		printf("Error: unable to find bdinfo partition\n");
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+	}
+
+	if (mtd->size < ORAY_BDINFO_TAIL_OFFSET + ORAY_BDINFO_TAIL_SIZE ||
+	    ORAY_BDINFO_TAIL_OFFSET % mtd->erasesize ||
+	    ORAY_BDINFO_TAIL_SIZE % mtd->erasesize) {
+		printf("Error: unexpected bdinfo geometry (size 0x%llx, erase 0x%x)\n",
+		       mtd->size, mtd->erasesize);
+		put_mtd_device(mtd);
+		return -EINVAL;
+	}
+
+	ret = mtd_erase_skip_bad(mtd, ORAY_BDINFO_TAIL_OFFSET,
+				 ORAY_BDINFO_TAIL_SIZE,
+				 ORAY_BDINFO_TAIL_SIZE, NULL, NULL,
+				 "bdinfo stock tail", true);
+	put_mtd_device(mtd);
+	if (ret)
+		return ret;
+
+	mtd = get_mtd_device_nm("kpanic");
+	if (IS_ERR_OR_NULL(mtd)) {
+		printf("Error: unable to find kpanic partition\n");
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+	}
+
+	ret = mtd_erase_skip_bad(mtd, 0, mtd->size, mtd->size, NULL, NULL,
+				 "kpanic stock partition", true);
+	put_mtd_device(mtd);
+
+	if (!ret)
+		printf("httpd: Oray X1 Pro stock auxiliary partitions restored\n");
+
+	return ret;
+}
+#endif
+
 #ifdef CONFIG_MTD_LAYOUT_SPI_NAND
 extern const char *mtd_layout_spi_nand_replace(const char *str, char *buf,
 					       size_t bufsz);
@@ -380,11 +453,18 @@ void result_handler(enum httpd_uri_handler_status status,
 			failsafe_prepare_mtd_layout();
 			mtd_layout_save_pending = mtd_layout_label[0] != '\0';
 #endif
-			if (fw_type == FW_TYPE_INITRD)
+			if (fw_type == FW_TYPE_INITRD) {
 				st->ret = 0;
-			else
-				st->ret = failsafe_write_image(upload_data,
+			} else {
+#if defined(CONFIG_MEDIATEK_MULTI_MTD_LAYOUT) && defined(CONFIG_MTD)
+				st->ret = failsafe_restore_oray_ubi0_aux_parts(fw_type);
+				if (!st->ret)
+#else
+				st->ret = 0;
+#endif
+					st->ret = failsafe_write_image(upload_data,
 							       upload_size, fw_type);
+			}
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
 			if (st->ret)
 				mtd_layout_save_pending = false;

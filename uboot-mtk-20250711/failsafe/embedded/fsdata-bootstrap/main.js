@@ -563,7 +563,7 @@ function ensureBranding() {
     if (!versionNode.querySelector?.(".brand-inline")) {
         const brandNode = document.createElement("span");
         brandNode.className = "brand-inline";
-        brandNode.textContent = AUTHOR_DISPLAY;
+        brandNode.textContent = `${AUTHOR_DISPLAY} OpenRouter适配`;
         versionNode.append(" ", brandNode);
     }
 

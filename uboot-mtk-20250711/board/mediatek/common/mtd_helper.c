@@ -524,9 +524,27 @@ int mtd_read_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 int mtd_update_generic(struct mtd_info *mtd, const void *data, size_t size,
 		       bool verify)
 {
+	u64 erase_size = size;
 	int ret;
 
-	ret = mtd_erase_skip_bad(mtd, 0, size, mtd->size, NULL, NULL, NULL,
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+	/*
+	 * A stock X1 Pro UBI backup may contain only its allocated PEBs and be
+	 * shorter than the 56 MiB slot.  When returning from the overlapping
+	 * TR3000 layout, stale UBI EC/VID headers in the unwritten tail can make
+	 * Linux reject the newly written image.  Erase the complete stock slot
+	 * before writing it; other layouts and partitions keep the normal
+	 * size-limited erase behaviour.
+	 */
+	if (mtd && mtd->name && !strcmp(mtd->name, "ubi_0") &&
+	    env_get("mtd_layout") &&
+	    !strcmp(env_get("mtd_layout"), "oray-ubi0")) {
+		erase_size = mtd->size;
+		printf("Erasing complete Oray ubi_0 stock slot before update\n");
+	}
+#endif
+
+	ret = mtd_erase_skip_bad(mtd, 0, erase_size, mtd->size, NULL, NULL, NULL,
 				 true);
 	if (ret)
 		return ret;
