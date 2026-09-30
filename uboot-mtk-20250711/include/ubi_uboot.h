@@ -45,6 +45,7 @@
 
 /* functions */
 int ubi_mtd_param_parse(const char *val, struct kernel_param *kp);
+int ubi_mtd_param_validate(const char *val);
 int ubi_init(void);
 void ubi_exit(void);
 

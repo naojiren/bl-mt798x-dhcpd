@@ -204,48 +204,42 @@ static void failsafe_prepare_mtd_layout(void)
 	env_set("mtdparts", NULL);
 }
 
-static void failsafe_save_mtd_layout(void)
+static int failsafe_save_mtd_layout(void)
 {
 	const char *env_layout, *legacy_layout;
-	bool need_save = false;
+	int ret;
 
 	if (!mtd_layout_save_pending)
-		return;
+		return 0;
 
 	env_layout = env_get("mtd_layout");
 	legacy_layout = env_get("mtd_layout_label");
 
 	if (!env_layout || strcmp(env_layout, mtd_layout_label)) {
 		env_set("mtd_layout", mtd_layout_label);
-		need_save = true;
 	}
 
 	if (!legacy_layout || strcmp(legacy_layout, mtd_layout_label)) {
 		env_set("mtd_layout_label", mtd_layout_label);
-		need_save = true;
 	}
 
 	if (env_get("mtdids")) {
 		env_set("mtdids", NULL);
-		need_save = true;
 	}
 
 	if (env_get("mtdparts")) {
 		env_set("mtdparts", NULL);
-		need_save = true;
 	}
 
-	if (!need_save) {
-		mtd_layout_save_pending = false;
-		return;
+	/* Always persist a successfully written selection before reporting success. */
+	ret = env_save();
+	if (ret) {
+		printf("Error: failed to save mtd layout env\n");
+		return ret;
 	}
-
-	if (!env_save())
-		printf("httpd: saved mtd layout: %s\n", mtd_layout_label);
-	else
-		printf("Warning: failed to save mtd layout env\n");
-
+	printf("httpd: saved mtd layout: %s\n", mtd_layout_label);
 	mtd_layout_save_pending = false;
+	return 0;
 }
 
 static void append_mtdlayout_label(char *buf, size_t size, const char *label)
@@ -510,6 +504,8 @@ void result_handler(enum httpd_uri_handler_status status,
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
 			if (st->ret)
 				mtd_layout_save_pending = false;
+			else
+				st->ret = failsafe_save_mtd_layout();
 #endif
 		}
 
@@ -537,11 +533,6 @@ void result_handler(enum httpd_uri_handler_status status,
 		upgrade_success = !st->ret;
 		auto_action_pending = upgrade_success &&
 			(fw_type == FW_TYPE_INITRD || failsafe_auto_reboot_enabled());
-
-#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
-		if (upgrade_success)
-			failsafe_save_mtd_layout();
-#endif
 
 		free(response->session_data);
 	}

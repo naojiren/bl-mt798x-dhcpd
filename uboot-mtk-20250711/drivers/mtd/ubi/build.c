@@ -1421,43 +1421,54 @@ static int __init bytes_str_to_int(const char *str)
 
 int kstrtoint(const char *s, unsigned int base, int *res)
 {
-	unsigned long long tmp;
+	unsigned int value = 0, digit, limit;
+	bool negative = false, have_digit = false;
 
-	tmp = simple_strtoull(s, NULL, base);
-	if (tmp != (unsigned long long)(int)tmp)
-		return -ERANGE;
-
-	return (int)tmp;
+	if (!s || !res || base == 1 || base > 36)
+		return -EINVAL;
+	if (*s == '-' || *s == '+') {
+		negative = *s == '-';
+		s++;
+	}
+	if (!base)
+		base = s[0] == '0' ? ((s[1] == 'x' || s[1] == 'X') ? 16 : 8) : 10;
+	if (base == 16 && s[0] == '0' &&
+	    (s[1] == 'x' || s[1] == 'X')) {
+		base = 16;
+		s += 2;
+	}
+	limit = (unsigned int)INT_MAX + negative;
+	for (; *s; s++) {
+		if (*s >= '0' && *s <= '9')
+			digit = *s - '0';
+		else if (*s >= 'a' && *s <= 'z')
+			digit = *s - 'a' + 10;
+		else if (*s >= 'A' && *s <= 'Z')
+			digit = *s - 'A' + 10;
+		else
+			break;
+		if (digit >= base)
+			break;
+		if (value > (limit - digit) / base)
+			return -ERANGE;
+		value = value * base + digit;
+		have_digit = true;
+	}
+	if (!have_digit || (*s && (*s != '\n' || s[1])))
+		return -EINVAL;
+	*res = negative ? -(long long)value : value;
+	return 0;
 }
 
-/**
- * ubi_mtd_param_parse - parse the 'mtd=' UBI parameter.
- * @val: the parameter value to parse
- * @kp: not used
- *
- * This function returns zero in case of success and a negative error code in
- * case of error.
- */
-#ifndef __UBOOT__
-static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
-#else
-int ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
-#endif
+static int ubi_mtd_param_parse_one(const char *val, struct mtd_dev_param *p)
 {
 	int i, len;
-	struct mtd_dev_param *p;
 	char buf[MTD_PARAM_LEN_MAX];
 	char *pbuf = &buf[0];
 	char *tokens[MTD_PARAM_MAX_COUNT], *token;
 
 	if (!val)
 		return -EINVAL;
-
-	if (mtd_devs == UBI_MAX_DEVICES) {
-		pr_err("UBI error: too many parameters, max. is %d\n",
-		       UBI_MAX_DEVICES);
-		return -EINVAL;
-	}
 
 	len = strnlen(val, MTD_PARAM_LEN_MAX);
 	if (len == MTD_PARAM_LEN_MAX) {
@@ -1485,7 +1496,9 @@ int ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
 		return -EINVAL;
 	}
 
-	p = &mtd_dev_param[mtd_devs];
+	memset(p, 0, sizeof(*p));
+	if (!tokens[0][0])
+		return -EINVAL;
 	strcpy(&p->name[0], tokens[0]);
 
 	token = tokens[1];
@@ -1519,7 +1532,45 @@ int ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
 	} else
 		p->ubi_num = UBI_DEV_NUM_AUTO;
 
-	mtd_devs += 1;
+	if (p->max_beb_per1024 < 0 ||
+	    p->max_beb_per1024 > MAX_MTD_UBI_BEB_LIMIT ||
+	    p->ubi_num < UBI_DEV_NUM_AUTO || p->ubi_num >= UBI_MAX_DEVICES)
+		return -EINVAL;
+	return 0;
+}
+
+#ifdef __UBOOT__
+/* Check parameters before deciding whether an attach failure needs an erase. */
+int ubi_mtd_param_validate(const char *val)
+{
+	struct mtd_dev_param p;
+
+	return ubi_mtd_param_parse_one(val, &p);
+}
+#endif
+
+/**
+ * ubi_mtd_param_parse - parse the 'mtd=' UBI parameter.
+ * @val: the parameter value to parse
+ * @kp: not used
+ *
+ * Return: zero on success, negative error code on failure.
+ */
+#ifndef __UBOOT__
+static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
+#else
+int ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
+#endif
+{
+	struct mtd_dev_param p;
+	int ret;
+
+	if (mtd_devs == UBI_MAX_DEVICES)
+		return -EINVAL;
+	ret = ubi_mtd_param_parse_one(val, &p);
+	if (ret || !val || !val[0])
+		return ret;
+	mtd_dev_param[mtd_devs++] = p;
 	return 0;
 }
 

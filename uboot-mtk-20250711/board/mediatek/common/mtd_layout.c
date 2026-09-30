@@ -161,6 +161,12 @@ void board_mtdparts_default(const char **mtdids, const char **mtdparts)
 		layout_node = ofnode_get_mtd_layout(layout_label);
 	}
 
+	/* Custom board labels may not contain a literal "default" entry. */
+	if (!ofnode_valid(layout_node) && !strcmp(layout_label, "default"))
+		layout_node = ofnode_get_default_mtd_layout();
+	if (ofnode_valid(layout_node) && !custom_parts)
+		layout_label = ofnode_read_string(layout_node, "label");
+
 	if (ofnode_valid(layout_node)) {
 		ids = ofnode_read_string(layout_node, "mtdids");
 		parts = ofnode_read_string(layout_node, "mtdparts");

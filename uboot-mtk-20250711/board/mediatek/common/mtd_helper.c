@@ -8,6 +8,8 @@
  */
 
 #include <env.h>
+#include <asm/unaligned.h>
+#include <dm/ofnode.h>
 #include <exports.h>
 #include <errno.h>
 #include <fdt_support.h>
@@ -307,18 +309,35 @@ static int mtd_validate_block(struct mtd_info *mtd, u64 addr, size_t size,
 	return 0;
 }
 
-int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
+/* UBI/UBIFS expects unused trailing pages to remain physically erased.
+ * Programming 0xff can still program NAND ECC/OOB bits, making later UBI
+ * writes to those pages fail. Keep block positions and verify the full input.
+ */
+static size_t mtd_ubi_drop_ffs(struct mtd_info *mtd, const void *data, size_t len)
+{
+	const u8 *bytes = data;
+	size_t end = len;
+
+	while (end && bytes[end - 1] == 0xff)
+		end--;
+	return ALIGN(end, mtd->writesize);
+}
+
+static int mtd_write_skip_bad_common(struct mtd_info *mtd, u64 offset, size_t size,
 		       u64 maxsize, size_t *writtensize, const void *data,
-		       bool verify)
+		       bool verify, bool trimffs)
 {
 	struct mtd_oob_ops ops;
 	bool checkbad = true;
-	size_t len, chksz;
+	size_t len, chksz, write_size, trimmed = 0;
 	u64 addr, limit;
 	u32 blockoff;
 	int ret;
 
 	if (!mtd)
+		return -EINVAL;
+	if (trimffs && (!mtd->writesize || offset % mtd->writesize ||
+			size % mtd->writesize))
 		return -EINVAL;
 
 	if (!size) {
@@ -345,6 +364,8 @@ int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 	printf("Writing '%s' from 0x%lx to 0x%llx, size 0x%zx ... ", mtd->name,
 	       (ulong)data, mtd->offset + offset, size);
 
+	if (trimffs)
+		printf("[UBI: keep trailing 0xff pages erased] ");
 	limit = offset + maxsize;
 	addr = offset;
 	len = size;
@@ -385,14 +406,19 @@ int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 
 		ops.mode = MTD_OPS_AUTO_OOB;
 		ops.datbuf = (void *)data;
-		ops.len = chksz;
+		write_size = trimffs ? mtd_ubi_drop_ffs(mtd, data, chksz) : chksz;
+		ops.len = write_size;
 		ops.retlen = 0;
 
-		ret = mtd_write_oob(mtd, addr, &ops);
-		if (ret) {
-			printf("Failed at 0x%llx, err = %d\n",
-			       mtd->offset + addr, ret);
-			return ret;
+		if (write_size) {
+			ret = mtd_write_oob(mtd, addr, &ops);
+			if (ret) {
+				printf("Failed at 0x%llx, err = %d\n",
+				       mtd->offset + addr, ret);
+				return ret;
+			}
+			if (trimffs && ops.retlen != write_size)
+				return -EIO;
 		}
 
 		if (verify) {
@@ -401,6 +427,11 @@ int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 				return ret;
 		}
 
+		if (trimffs) {
+			trimmed += chksz - write_size;
+			/* Input and flash offsets still include the erased tail. */
+			ops.retlen = chksz;
+		}
 		addr += ops.retlen;
 		len -= ops.retlen;
 		data += ops.retlen;
@@ -414,9 +445,21 @@ int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 		return -ENODATA;
 	}
 
-	printf("OK\n");
+	if (trimffs)
+		printf("OK (%zu trailing blank pages left erased)\n",
+		       trimmed / mtd->writesize);
+	else
+		printf("OK\n");
 
 	return 0;
+}
+
+int mtd_write_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
+		       u64 maxsize, size_t *writtensize, const void *data,
+		       bool verify)
+{
+	return mtd_write_skip_bad_common(mtd, offset, size, maxsize, writtensize,
+					 data, verify, false);
 }
 
 int mtd_read_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
@@ -521,31 +564,83 @@ int mtd_read_skip_bad(struct mtd_info *mtd, u64 offset, size_t size,
 	return 0;
 }
 
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+const char *get_mtd_layout_label(void);
+
+static bool mtd_firmware_layout_flag(struct mtd_info *mtd,
+				     const char *flag)
+{
+	ofnode node, layout;
+	const char *selected, *label, *part;
+
+	if (!mtd || !mtd->name)
+		return false;
+
+	selected = get_mtd_layout_label();
+	node = ofnode_path("/mtd-layout");
+	if (!selected || !ofnode_valid(node))
+		return false;
+
+	ofnode_for_each_subnode(layout, node) {
+		label = ofnode_read_string(layout, "label");
+		if (!label || strcmp(selected, label) ||
+		    !ofnode_read_bool(layout, flag))
+			continue;
+		part = ofnode_read_string(layout, "factory_part");
+		if (!part)
+			part = PART_UBI_NAME;
+		return !strcmp(mtd->name, part);
+	}
+	return false;
+}
+#else
+static bool mtd_firmware_layout_flag(struct mtd_info *mtd,
+				     const char *flag)
+{
+	return false;
+}
+#endif
+
+static bool mtd_firmware_full_erase(struct mtd_info *mtd)
+{
+	return mtd_firmware_layout_flag(mtd, "erase-before-upgrade");
+}
+
+static int mtd_erase_firmware(struct mtd_info *mtd, size_t size)
+{
+	bool complete = mtd_firmware_full_erase(mtd);
+	bool oray_stock = false;
+
+	if (!mtd || !size || size > mtd->size)
+		return -EFBIG;
+#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
+	/* Retain the upstream X1 Pro recovery policy for both generic and UBI writes. */
+	if (mtd->name && !strcmp(mtd->name, "ubi_0") &&
+	    env_get("mtd_layout") &&
+	    !strcmp(env_get("mtd_layout"), "oray-ubi0")) {
+		complete = true;
+		oray_stock = true;
+	}
+#endif
+	if (complete) {
+#ifdef CONFIG_CMD_UBI
+		ubi_detach();
+#endif
+		printf("Erasing complete '%s' firmware partition (0x%llx bytes)\n",
+		       mtd->name, mtd->size);
+	}
+	return mtd_erase_skip_bad(mtd, 0, complete ? mtd->size : size,
+				  mtd->size, NULL, NULL, NULL, oray_stock || !complete);
+}
+
 int mtd_update_generic(struct mtd_info *mtd, const void *data, size_t size,
 		       bool verify)
 {
-	u64 erase_size = size;
 	int ret;
 
-#ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
-	/*
-	 * A stock X1 Pro UBI backup may contain only its allocated PEBs and be
-	 * shorter than the 56 MiB slot.  When returning from the overlapping
-	 * TR3000 layout, stale UBI EC/VID headers in the unwritten tail can make
-	 * Linux reject the newly written image.  Erase the complete stock slot
-	 * before writing it; other layouts and partitions keep the normal
-	 * size-limited erase behaviour.
-	 */
-	if (mtd && mtd->name && !strcmp(mtd->name, "ubi_0") &&
-	    env_get("mtd_layout") &&
-	    !strcmp(env_get("mtd_layout"), "oray-ubi0")) {
-		erase_size = mtd->size;
-		printf("Erasing complete Oray ubi_0 stock slot before update\n");
-	}
-#endif
-
-	ret = mtd_erase_skip_bad(mtd, 0, erase_size, mtd->size, NULL, NULL, NULL,
-				 true);
+	if (!data)
+		return -EINVAL;
+	ret = mtd_erase_firmware(mtd, size);
 	if (ret)
 		return ret;
 
@@ -734,11 +829,23 @@ static int write_ubi1_image(const void *data, size_t size,
 				  ii->ubi_size + ii->marker_size, true);
 }
 
-static int mount_ubi(struct mtd_info *mtd, bool create)
+static int mount_ubi_params(struct mtd_info *mtd, bool create,
+			    const char *params)
 {
+	char param[80];
 	int ret;
 
-	ret = ubi_part(mtd->name, NULL);
+	ret = snprintf(param, sizeof(param), "%s%s%s", mtd->name,
+		       params ? "," : "", params ? params : "");
+	if (ret < 0 || ret >= sizeof(param))
+		return -EINVAL;
+	ret = ubi_mtd_param_validate(param);
+	if (ret) {
+		printf("Invalid UBI parameters for '%s'; partition retained\n",
+		       mtd->name);
+		return ret;
+	}
+	ret = ubi_part(mtd->name, params);
 	if (ret) {
 		if (create) {
 			cprintln(CAUTION, "*** Failed to attach UBI ***");
@@ -751,7 +858,7 @@ static int mount_ubi(struct mtd_info *mtd, bool create)
 			if (ret)
 				return ret;
 
-			ret = ubi_part(mtd->name, NULL);
+			ret = ubi_part(mtd->name, params);
 		}
 
 		if (ret) {
@@ -761,6 +868,11 @@ static int mount_ubi(struct mtd_info *mtd, bool create)
 	}
 
 	return 0;
+}
+
+static int mount_ubi(struct mtd_info *mtd, bool create)
+{
+	return mount_ubi_params(mtd, create, NULL);
 }
 
 int ubi_mount_default(void)
@@ -901,6 +1013,94 @@ static int update_ubi_volume(const char *volume, int vol_id, const void *data,
 static int read_ubi_volume(const char *volume, void *buff, size_t size)
 {
 	return ubi_volume_read((char *)volume, buff, 0, size);
+}
+
+static int mtd_update_ubi_image(struct mtd_info *mtd, const void *data,
+				size_t size)
+{
+	int ret;
+
+	if (!mtd || !data || !mtd->writesize || size % mtd->writesize)
+		return -EINVAL;
+	ret = mtd_erase_firmware(mtd, size);
+	if (ret)
+		return ret;
+	return mtd_write_skip_bad_common(mtd, 0, size, mtd->size, NULL, data,
+					 true, true);
+}
+
+static int write_stock_ubi_image(const void *data, size_t size,
+				 struct mtd_info *mtd)
+{
+	struct mtd_info *backup;
+	struct ubi_volume *vol;
+	bool stock;
+	int ret, vol_id;
+
+	stock = mtd_firmware_full_erase(mtd);
+	ret = mtd_update_ubi_image(mtd, data, size);
+	if (ret || !stock)
+		return ret;
+
+	ret = mount_ubi(mtd, false);
+	if (ret)
+		return ret;
+
+	/* A factory UBI dump contains the donor router's writable overlay.
+	 * Recreate it once during flashing; normal boots never reset it.
+	 */
+	vol = ubi_find_volume(PART_ROOTFS_DATA_NAME);
+	if (!vol || !ubi_find_volume(PART_KERNEL_NAME) ||
+	    !ubi_find_volume(PART_ROOTFS_NAME))
+		return 0;
+	vol_id = vol->vol_id;
+	printf("Recreating rootfs_data for a clean persistent configuration\n");
+	ret = remove_ubi_volume(PART_ROOTFS_DATA_NAME);
+	if (ret)
+		return ret;
+	ret = create_ubi_volume(PART_ROOTFS_DATA_NAME, 0, vol_id, true);
+	if (ret)
+		return ret;
+
+	/* The stock image covers ubi only. Initialize the separate conf backup
+	 * when its UBI table is missing, retaining an existing conf volume.
+	 */
+	ubi_detach();
+	backup = get_mtd_device_nm("Config_backup");
+	if (IS_ERR_OR_NULL(backup))
+		return -ENODEV;
+	put_mtd_device(backup);
+	/* NMBM already remaps physical bad blocks. A 4 MiB conf partition
+	 * needs at least 17 LEBs for UBIFS, so reserve one UBI spare here.
+	 */
+	ret = mount_ubi_params(backup, true, "0,1");
+	if (ret)
+		return ret;
+	if (!ubi_find_volume("conf")) {
+		printf("Initializing stock Config_backup/conf volume\n");
+		ret = create_ubi_volume("conf", 0, 0, true);
+	}
+	ubi_detach();
+	if (ret)
+		return ret;
+
+	/* Re-read modified volume tables before declaring the upgrade successful. */
+	printf("Rechecking Config_backup/conf after initialization\n");
+	ret = mount_ubi_params(backup, false, "0,1");
+	if (!ret && !ubi_find_volume("conf"))
+		ret = -ENODEV;
+	ubi_detach();
+	if (ret)
+		return ret;
+
+	printf("Rechecking firmware UBI after configuration reset\n");
+	ret = mount_ubi(mtd, false);
+	if (!ret && (!ubi_find_volume(PART_KERNEL_NAME) ||
+		     !ubi_find_volume(PART_ROOTFS_NAME) ||
+		     !ubi_find_volume(PART_ROOTFS_DATA_NAME)))
+		ret = -ENODEV;
+	ubi_detach();
+	return ret;
 }
 
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
@@ -1070,6 +1270,23 @@ static int write_ubi2_tar_image(const void *data, size_t size,
 	if (ret)
 		return ret;
 
+	if (mtd_firmware_full_erase(mtd)) {
+		/* Standard OpenWrt tar files do not need a vendor /rootfs hash. */
+		if (kernel_size < sizeof(struct fdt_header) || rootfs_size < 96)
+			return -EBADMSG;
+		if (kernel_size > mtd->size ||
+		    rootfs_size > mtd->size - kernel_size)
+			return -EFBIG;
+		if (!verify_standalone_image_ram(kernel_data, kernel_size) ||
+		    get_unaligned_le32(rootfs_data) != 0x73717368 ||
+		    get_unaligned_le64(rootfs_data + 40) < 96 ||
+		    get_unaligned_le64(rootfs_data + 40) > rootfs_size)
+			return -EBADMSG;
+		ret = mtd_erase_firmware(mtd, kernel_size + rootfs_size);
+		if (ret)
+			return ret;
+	}
+
 	ret = mount_ubi(mtd, UBI_MOUNT_RECREATE);
 	if (ret)
 		return ret;
@@ -1122,18 +1339,47 @@ static int write_ubi_itb_image(const void *data, size_t size,
 		rootfs_data_part = PART_ROOTFS_DATA_NAME;
 	}
 
+	if (mtd_firmware_full_erase(mtd) ||
+	    mtd_firmware_layout_flag(mtd, "erase-before-fit-upgrade")) {
+		/* Validate everything before discarding the previous firmware. */
+		if (!data || size < sizeof(struct fdt_header) ||
+		    !verify_standalone_image_ram(data, size))
+			return -EBADMSG;
+		if (size > mtd->size)
+			return -EFBIG;
+		ubi_detach();
+		printf("Erasing complete '%s' before FIT upgrade (0x%llx bytes)\n",
+		       mtd->name, mtd->size);
+		ret = mtd_erase_skip_bad(mtd, 0, mtd->size, mtd->size,
+					 NULL, NULL, NULL, false);
+		if (ret)
+			return ret;
+	}
+
 	ret = mount_ubi(mtd, UBI_MOUNT_RECREATE);
 	if (ret)
 		return ret;
 
 	/* Remove possibly existed kernel/rootfs volume */
-	remove_ubi_volume(PART_KERNEL_NAME);
-	remove_ubi_volume(PART_ROOTFS_NAME);
+	if (ubi_find_volume(PART_KERNEL_NAME)) {
+		ret = remove_ubi_volume(PART_KERNEL_NAME);
+		if (ret)
+			return ret;
+	}
+	if (ubi_find_volume(PART_ROOTFS_NAME)) {
+		ret = remove_ubi_volume(PART_ROOTFS_NAME);
+		if (ret)
+			return ret;
+	}
 
 	if (!IS_ENABLED(CONFIG_MTK_DUAL_BOOT) ||
 	    !IS_ENABLED(CONFIG_MTK_DUAL_BOOT_RESERVE_ROOTFS_DATA)) {
 		/* Remove this volume first in case of no enough PEBs */
-		remove_ubi_volume(rootfs_data_part);
+		if (ubi_find_volume(rootfs_data_part)) {
+			ret = remove_ubi_volume(rootfs_data_part);
+			if (ret)
+				return ret;
+		}
 	}
 
 	ret = ubi_check_reserved_volumes(false);
@@ -1179,7 +1425,18 @@ static int write_ubi_itb_image(const void *data, size_t size,
 	if (IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
 		return mtd_dual_boot_post_upgrade(slot, rootfs_data_part);
 
-	return create_ubi_volume(rootfs_data_part, 0, -1, true);
+	ret = create_ubi_volume(rootfs_data_part, 0, -1, true);
+	if (ret || !mtd_firmware_layout_flag(mtd, "erase-before-fit-upgrade"))
+		return ret;
+
+	/* A successful update must remain readable after a fresh attach. */
+	ubi_detach();
+	ret = mount_ubi(mtd, false);
+	if (!ret && (!ubi_find_volume(firmware_part) ||
+		     !ubi_find_volume(rootfs_data_part)))
+		ret = -ENOENT;
+	ubi_detach();
+	return ret;
 }
 
 static int ubi_image_read(struct image_read_priv *rpriv, void *buff, u64 addr,
@@ -1472,6 +1729,15 @@ static int boot_from_ubi(struct mtd_info *mtd, bool do_boot)
 		volname_secondary = PART_FIT_NAME;
 	}
 
+	/* FIT layouts intentionally have no separate kernel volume. */
+	if (!ubi_find_volume(volname_primary) &&
+	    ubi_find_volume(volname_secondary)) {
+		const char *tmp = volname_primary;
+
+		volname_primary = volname_secondary;
+		volname_secondary = tmp;
+	}
+
 	ret = read_ubi_volume(volname_primary, (void *)data_load_addr, 0);
 	if (ret) {
 		ret = read_ubi_volume(volname_secondary,
@@ -1746,7 +2012,7 @@ int ubi_update_bsp_conf(const void *bspconf, uint32_t index)
 int mtd_upgrade_image(const void *data, size_t size)
 {
 #if defined(CONFIG_CMD_UBI) || !defined(CONFIG_MTK_DUAL_BOOT)
-	struct owrt_image_info ii;
+	struct owrt_image_info ii = { 0 };
 	struct mtd_info *mtd;
 	int ret;
 #endif
@@ -1761,6 +2027,12 @@ int mtd_upgrade_image(const void *data, size_t size)
 #endif
 #endif /* CONFIG_CMD_UBI */
 
+	if (!data || size < sizeof(struct fdt_header))
+		return -EINVAL;
+#ifdef CONFIG_CMD_UBI
+	/* Release the old partition before regenerating a changed layout. */
+	ubi_detach();
+#endif
 	gen_mtd_probe_devices();
 
 #ifdef CONFIG_CMD_UBI
@@ -1796,14 +2068,15 @@ int mtd_upgrade_image(const void *data, size_t size)
 
 			if (!ret && ii.type == IMAGE_UBI2 &&
 			    !IS_ENABLED(CONFIG_MTK_DUAL_BOOT))
-				return mtd_update_generic(mtd, data, size, true);
+				return write_stock_ubi_image(data, size, mtd);
 
 			if (!ret && ii.type == IMAGE_TAR &&
 			    !IS_ENABLED(CONFIG_MTK_DUAL_BOOT_ITB_IMAGE)) {
 #ifdef CONFIG_MEDIATEK_MULTI_MTD_LAYOUT
 				ubi_kernel_part = env_get("sysupgrade_kernel_ubipart");
 				ubi_rootfs_part = env_get("sysupgrade_rootfs_ubipart");
-				if (ubi_kernel_part && ubi_rootfs_part) {
+				if (ubi_kernel_part && ubi_rootfs_part &&
+				    strcmp(ubi_kernel_part, ubi_rootfs_part)) {
 					mtd_ubikernel = get_mtd_device_nm(ubi_kernel_part);
 					mtd_ubirootfs = get_mtd_device_nm(ubi_rootfs_part);
 					if (!IS_ERR_OR_NULL(mtd_ubikernel) && !IS_ERR_OR_NULL(mtd_ubirootfs)) {
@@ -1908,6 +2181,141 @@ void mtd_boot_set_defaults(void *fdt)
 #ifdef CONFIG_CMD_UBI
 	if (ubi_image_vol)
 		rootdisk_set_rootfs_ubi_relax(fdt, ubi_image_vol);
+#endif
+}
+
+
+/*
+ * CT3003 upstream ubootmod images use raw NAND and the entire chip tail.
+ * This reference-derived bootloader uses NMBM and a 113152 KiB UBI area.
+ * Repair only the known board/layout, after FIT verification, on the RAM FDT.
+ * All nodes and phandles remain in place (fitblk, MAC and calibration cells).
+ */
+int mtd_fixup_linux_fdt(void *fdt)
+{
+#ifdef CONFIG_ENABLE_NAND_NMBM
+	static const char * const labels[] = {
+		"BL2", "u-boot-env", "art", "Factory", "FIP", "ubi"
+	};
+	static const u32 offsets[] = {
+		0, 0x100000, 0x180000, 0x280000, 0x380000, 0x580000
+	};
+	static const u32 sizes[] = {
+		0x100000, 0x80000, 0x100000, 0x100000, 0x200000
+	};
+	struct mtd_info *mtd, *nmbm;
+	const fdt32_t *reg;
+	const char *label;
+	int flash, parts, child, ubi_node = -1, len, index = 0, ret;
+	int old_size, new_size;
+	fdt32_t new_reg[2];
+	void *copy;
+
+	if (!fdt || fdt_node_check_compatible(fdt, 0, "cetron,ct3003-ubootmod"))
+		return 0;
+
+	mtd = get_mtd_device_nm(PART_UBI_NAME);
+	if (IS_ERR_OR_NULL(mtd))
+		return 0;
+	ret = mtd_firmware_layout_flag(mtd, "linux-nmbm-fixup") &&
+	      mtd->offset == 0x580000 && mtd->size == 0x6e80000;
+	put_mtd_device(mtd);
+	if (!ret)
+		return 0;
+
+	nmbm = get_mtd_device_nm("nmbm0");
+	if (IS_ERR_OR_NULL(nmbm))
+		return -ENODEV;
+	ret = nmbm->size >= 0x7400000 && nmbm->erasesize == 0x20000 &&
+	      nmbm->writesize == 0x800;
+	put_mtd_device(nmbm);
+	if (!ret)
+		return -EINVAL;
+
+	flash = fdt_node_offset_by_compatible(fdt, -1, "spi-nand");
+	if (flash < 0 ||
+	    fdt_node_offset_by_compatible(fdt, flash, "spi-nand") >= 0)
+		return -EINVAL;
+	/* Already compatible kernels retain their NMBM settings. */
+	if (fdt_getprop(fdt, flash, "mediatek,nmbm", NULL))
+		return 0;
+	if (fdt_getprop(fdt, flash, "mediatek,bmt-v2", NULL) ||
+	    fdt_getprop(fdt, flash, "mediatek,bbt", NULL))
+		return -EINVAL;
+	parts = fdt_subnode_offset(fdt, flash, "partitions");
+	if (parts < 0 || fdt_node_check_compatible(fdt, parts, "fixed-partitions"))
+		return -EINVAL;
+	reg = fdt_getprop(fdt, parts, "#address-cells", &len);
+	if (!reg || len != 4 || fdt32_to_cpu(*reg) != 1)
+		return -EINVAL;
+	reg = fdt_getprop(fdt, parts, "#size-cells", &len);
+	if (!reg || len != 4 || fdt32_to_cpu(*reg) != 1)
+		return -EINVAL;
+
+	fdt_for_each_subnode(child, fdt, parts) {
+		if (index >= ARRAY_SIZE(labels))
+			return -EINVAL;
+		label = fdt_getprop(fdt, child, "label", &len);
+		if (!label || len != strlen(labels[index]) + 1 ||
+		    label[len - 1] != '\0' || strcasecmp(label, labels[index]))
+			return -EINVAL;
+		reg = fdt_getprop(fdt, child, "reg", &len);
+		if (!reg || len != sizeof(new_reg) ||
+		    fdt32_to_cpu(reg[0]) != offsets[index])
+			return -EINVAL;
+		if (index < ARRAY_SIZE(sizes)) {
+			if (fdt32_to_cpu(reg[1]) != sizes[index])
+				return -EINVAL;
+		} else {
+			if (fdt32_to_cpu(reg[1]) != 0x7a80000 &&
+			    fdt32_to_cpu(reg[1]) != 0x6e80000)
+				return -EINVAL;
+			ubi_node = child;
+		}
+		index++;
+	}
+	if (index != ARRAY_SIZE(labels) || ubi_node < 0)
+		return -EINVAL;
+
+	/* Work on a copy so any failed property write leaves the FDT intact. */
+	old_size = fdt_totalsize(fdt);
+	new_size = old_size + 512;
+	copy = malloc(new_size);
+	if (!copy)
+		return -ENOMEM;
+	ret = fdt_open_into(fdt, copy, new_size);
+	if (ret)
+		goto out;
+	new_reg[0] = cpu_to_fdt32(0x580000);
+	new_reg[1] = cpu_to_fdt32(0x6e80000);
+	ret = fdt_setprop_inplace(copy, ubi_node, "reg", new_reg, sizeof(new_reg));
+	if (ret)
+		goto out;
+	ret = fdt_setprop_u32(copy, flash, "mediatek,bmt-max-ratio",
+			      CONFIG_NMBM_MAX_RATIO);
+	if (ret)
+		goto out;
+	ret = fdt_setprop_u32(copy, flash, "mediatek,bmt-max-reserved-blocks",
+			      CONFIG_NMBM_MAX_BLOCKS);
+	if (ret)
+		goto out;
+	ret = fdt_setprop(copy, flash, "mediatek,nmbm", NULL, 0);
+	if (ret)
+		goto out;
+	ret = fdt_pack(copy);
+	if (ret)
+		goto out;
+	ret = fdt_increase_size(fdt, fdt_totalsize(copy) > old_size ?
+				 fdt_totalsize(copy) - old_size : 0);
+	if (ret)
+		goto out;
+	memcpy(fdt, copy, fdt_totalsize(copy));
+	printf("CT3003: Linux FDT uses NMBM and 113152 KiB UBI layout\n");
+out:
+	free(copy);
+	return ret;
+#else
+	return 0;
 #endif
 }
 

@@ -58,6 +58,8 @@ int mtd_upgrade_standalone_image(const char *name, bool bypass_ubi,
 
 void mtd_boot_set_defaults(void *fdt);
 
+int mtd_fixup_linux_fdt(void *fdt);
+
 int mtd_verify_linux_fdt(void *fdt);
 
 #endif /* _MTD_HELPER_H_ */

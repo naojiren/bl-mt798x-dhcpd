@@ -1,0 +1,40 @@
+ipaddr=192.168.6.1
+serverip=192.168.6.2
+loadaddr=0x46000000
+bootconf=config-1
+bootdelay=3
+bootfile=immortalwrt-mediatek-filogic-cetron_ct3003-emmc-initramfs-kernel.bin
+bootfile_bl2=ct3003-emmc-ddr4-preloader.bin
+bootfile_fip=ct3003-emmc-ddr4-bl31-uboot.fip
+bootfile_kernel=ct3003-emmc-kernel.itb
+bootled_pwr=green:status
+bootled_rec=red:status
+bootmenu_confirm_return=askenv - Press ENTER to return to menu ; bootmenu 60
+bootmenu_title=      *** CT3003 eMMC U-Boot / GPT Rescue Menu ***
+bootmenu_0=Boot OpenWrt from eMMC (default).=run boot_system
+bootmenu_1=Boot initramfs recovery via TFTP.=run boot_tftp_recovery ; run bootmenu_confirm_return
+bootmenu_2=Load raw kernel FIT via TFTP then write kernel partition.=run boot_tftp_write_kernel ; run bootmenu_confirm_return
+bootmenu_3=Load BL31+U-Boot FIP via TFTP then write fip partition.=run boot_tftp_write_fip ; run bootmenu_confirm_return
+bootmenu_4=Load BL2 preloader via TFTP then write eMMC boot0.=run boot_tftp_write_bl2 ; run bootmenu_confirm_return
+bootmenu_5=List current eMMC GPT partition table.=run gpt_list ; run bootmenu_confirm_return
+bootmenu_6=Verify current eMMC GPT partition table.=run gpt_verify ; run bootmenu_confirm_return
+bootmenu_7=Repair primary/backup eMMC GPT tables.=run gpt_repair ; run bootmenu_confirm_return
+bootmenu_8=[31mWRITE DEFAULT GPT (DESTROYS CURRENT PARTITION TABLE).[0m=run gpt_write_default ; run bootmenu_confirm_return
+bootmenu_9=Reboot.=reset
+bootmenu_10=Reset U-Boot environment to defaults.=eraseenv ; reset
+gpt_parts=name=ubootenv,start=4M,size=512K,type=u-boot-env;name=factory,start=4608K,size=1M,type=linux;name=art,start=5632K,size=1M,type=linux;name=fip,start=6656K,size=4M,type=system;name=kernel,start=12M,size=64M,type=linux;name=rootfs,start=76M,size=-,type=linux
+gpt_list=mmc dev 0 0 && mmc rescan && part list mmc 0 && gpt read mmc 0
+gpt_verify=mmc dev 0 0 && mmc rescan && gpt verify mmc 0 $gpt_parts
+gpt_repair=mmc dev 0 0 && mmc rescan && gpt repair mmc 0
+gpt_write_default=mmc dev 0 0 && mmc rescan && gpt write mmc 0 $gpt_parts && gpt verify mmc 0 $gpt_parts && part list mmc 0
+filesize_to_blk=setexpr cnt $filesize + 0x1ff && setexpr cnt $cnt / 0x200
+mmc_read_fit=mmc read $loadaddr $part_addr 0x100 && imszb $loadaddr image_size && test 0x$image_size -le 0x$part_size && mmc read $loadaddr $part_addr $image_size
+boot_system=led $bootled_pwr on ; mmc dev 0 0 && mmc rescan && part start mmc 0 kernel part_addr && part size mmc 0 kernel part_size && run mmc_read_fit && bootm $loadaddr#$bootconf
+boot_tftp_recovery=led $bootled_rec on ; dhcp $loadaddr $bootfile && bootm $loadaddr#$bootconf
+boot_tftp_write_kernel=dhcp $loadaddr $bootfile_kernel && iminfo $loadaddr && run emmc_write_kernel
+boot_tftp_write_fip=dhcp $loadaddr $bootfile_fip && run emmc_write_fip
+boot_tftp_write_bl2=dhcp $loadaddr $bootfile_bl2 && run emmc_write_bl2
+emmc_write_kernel=mmc dev 0 0 && part start mmc 0 kernel part_addr && part size mmc 0 kernel part_size && run filesize_to_blk && test 0x$cnt -le 0x$part_size && mmc write $loadaddr $part_addr $cnt
+emmc_write_fip=mmc dev 0 0 && part start mmc 0 fip part_addr && part size mmc 0 fip part_size && run filesize_to_blk && test 0x$cnt -le 0x$part_size && mmc write $loadaddr $part_addr $cnt
+emmc_write_bl2=run filesize_to_blk && test 0x$cnt -le 0x800 && mmc partconf 0 1 1 1 && mmc write $loadaddr 0x0 $cnt ; mmc partconf 0 1 1 0
+bootcmd=run boot_system ; run boot_tftp_recovery

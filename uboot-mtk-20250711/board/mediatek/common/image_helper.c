@@ -143,7 +143,8 @@ static int fill_ubi_info(const void *data, size_t size, u32 blocksize,
 	uintptr_t offset = 0;
 	u32 crc;
 
-	while (offset < size - blocksize) {
+	while (blocksize && size >= blocksize &&
+	       offset <= size - blocksize) {
 		memcpy(&ec, data + offset, sizeof(ec));
 
 		debug("%s: checking at 0x%p, magic = 0x%08x\n",
@@ -182,7 +183,8 @@ int find_ubi_start(const void *data, size_t size, u32 blocksize,
 	size_t offset = 0;
 	u32 crc;
 
-	while (offset < size - blocksize) {
+	while (blocksize && size >= blocksize &&
+	       offset <= size - blocksize) {
 		memcpy(&ec, data + offset, sizeof(ec));
 
 		debug("%s: checking at 0x%p, magic = 0x%08x\n",
@@ -471,7 +473,7 @@ int parse_image_ram(const void *data, size_t size, u32 blocksize,
 		break;
 #endif
 	default:
-		if (!tar_header_checksum(data)) {
+		if (size >= 512 && !tar_header_checksum(data)) {
 			ii->type = IMAGE_TAR;
 			ii->header_type = HEADER_UNKNOWN;
 			ii->kernel_size = ii->padding_size = 0;

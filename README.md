@@ -60,6 +60,8 @@ sudo apt install gcc-aarch64-linux-gnu build-essential flex bison libssl-dev dev
 
 ## Build
 
+CT3003 NAND multi-layout fixes and eMMC build instructions: [CT3003](document/CT3003.md).
+
 Configure once with:
 
 ```bash

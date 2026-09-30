@@ -182,9 +182,12 @@ void board_bootmenu_entries(const struct bootmenu_entry **menu, u32 *count)
 
 void default_boot_set_defaults(void *fdt)
 {
-#ifdef CONFIG_MTD_VERIFY_FDT
 	int ret;
 
+	ret = mtd_fixup_linux_fdt(fdt);
+	if (ret)
+		panic("CT3003: cannot safely align Linux NAND layout (%d)\n", ret);
+#ifdef CONFIG_MTD_VERIFY_FDT
 	ret = mtd_verify_linux_fdt(fdt);
 	if (ret) {
 #ifdef CONFIG_MTD_VERIFY_FDT_WARN_ONLY
